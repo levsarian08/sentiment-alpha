@@ -1,42 +1,42 @@
-# FinBERT Sentiment Alpha
+# Telemetry Anomaly Detection
 
-Extracting a quantitative alpha signal from financial news headlines using **FinBERT** and validating its predictive power on next-day returns via **walk-forward Information Coefficient (IC) analysis**.
+Anomaly detection on real **AWS CloudWatch** server telemetry using **Isolation Forest** and an **LSTM Autoencoder**. Flags abnormal sensor readings in cloud infrastructure streams — directly relevant to network health monitoring, satellite operations, and any system requiring automated anomaly alerting at scale.
 
-Applies the core quant research workflow — signal construction from alternative data, rigorous out-of-sample validation, and long/short portfolio simulation — to six large-cap tech stocks using real-world news data.
+Built with the **NAB (Numenta Anomaly Benchmark)** dataset, which includes real-world AWS server metrics with expert-labeled ground-truth anomalies.
 
 ---
 
-## Results
+## Results (AWS CloudWatch, 7 evaluated channels)
 
-| Metric | Value |
-|---|---|
-| IC (Spearman) | ~+0.08 |
-| IC t-statistic | ~1.9 |
-| Hit rate | ~54% |
-| L/S cumulative return | varies by period |
+| Model              | Mean F1 | Mean AUC |
+|--------------------|---------|----------|
+| Isolation Forest   |  0.83   |  0.78    |
+| LSTM Autoencoder   |  0.78   |  0.70    |
 
-> IC > 0.05 is considered meaningful in quantitative research. Results vary with news volume and market conditions — run `python run.py --period 1y` for more stable estimates.
+IF outperforms on sudden spike anomalies (e.g. grok_asg_anomaly, F1=1.0 vs 0.32).  
+LSTM outperforms on gradual/subtle pattern shifts (e.g. rds_cpu_utilization, F1=1.0 vs 0.53).
+
+> Evaluation uses **windowed F1** (±100 timesteps around each labeled point) — the standard protocol for NAB's sparse single-point labels.
 
 ---
 
 ## Project Structure
 
 ```
-sentiment-alpha/
+anomaly-detection-telemetry/
 ├── src/
 │   ├── data/
-│   │   ├── news.py          # yfinance headline fetcher
-│   │   └── prices.py        # price data + forward return construction
-│   ├── signal/
-│   │   ├── sentiment.py     # FinBERT scorer (ProsusAI/finbert)
-│   │   └── alpha.py         # daily signal aggregation + cross-sectional z-score
-│   └── backtest/
-│       └── validate.py      # IC, walk-forward, long/short portfolio, Plotly charts
-├── app/
-│   └── dashboard.py         # Streamlit signal explorer
+│   │   ├── download.py          # load NAB channels + anomaly labels
+│   │   └── preprocess.py        # windowing, normalization, train/test splits
+│   ├── models/
+│   │   ├── isolation_forest.py  # IF wrapper with window features
+│   │   └── lstm_autoencoder.py  # PyTorch seq-to-seq autoencoder
+│   └── evaluate.py              # windowed F1, threshold tuning, Plotly charts
 ├── notebooks/
-│   └── research.ipynb       # EDA + results walkthrough
-├── run.py                   # end-to-end pipeline script
+│   └── eda_and_results.ipynb    # EDA + full results walkthrough
+├── app/
+│   └── dashboard.py             # Streamlit anomaly explorer
+├── train.py                     # end-to-end training script
 ├── requirements.txt
 └── README.md
 ```
@@ -47,45 +47,62 @@ sentiment-alpha/
 
 ```bash
 # 1. Clone and install
-git clone https://github.com/levsarian08/sentiment-alpha.git
-cd sentiment-alpha
+git clone https://github.com/levsarian08/anomaly-detection-telemetry.git
+cd anomaly-detection-telemetry
 pip install -r requirements.txt
 
-# 2. Run the full pipeline
-python run.py
+# 2. Download the NAB dataset from https://github.com/numenta/NAB
+#    and move the folders into place:
+mv ~/Downloads/NAB-master/data data/raw/nab
+mv ~/Downloads/NAB-master/labels data/raw/labels
 
-# 3. Run with custom tickers and longer history
-python run.py --tickers AAPL MSFT TSLA --period 1y
+# 3. Train both models on a channel
+python train.py --channel realAWSCloudwatch/ec2_cpu_utilization_24ae8d
 
-# 4. Launch the interactive dashboard
+# 4. Train on all channels
+python train.py --all-channels --output results/summary.csv
+
+# 5. Launch the interactive dashboard
 streamlit run app/dashboard.py
 ```
 
 ---
 
-## Methodology
+## Dataset
 
-### 1. Data collection
-Financial news headlines are fetched for each ticker via yfinance. Each headline carries a publication timestamp, enabling alignment with next-day trading returns.
+**NAB (Numenta Anomaly Benchmark)** — a collection of real-world time series from AWS CloudWatch, Twitter, traffic sensors, and more, with expert-labeled anomaly timestamps.
 
-### 2. Sentiment scoring (FinBERT)
-Headlines are scored using [ProsusAI/FinBERT](https://huggingface.co/ProsusAI/finbert), a BERT model fine-tuned on financial news corpora. The continuous sentiment score is:
+This project uses the **realAWSCloudwatch** subset:
+- 17 channels of EC2, RDS, ELB, and network metrics
+- 7 channels with evaluable anomalies in the test split
+- Labels: single-point timestamps marking anomaly peaks
 
-```
-score = P(positive) - P(negative)  ∈ [-1, 1]
-```
+Source: [Numenta/NAB on GitHub](https://github.com/numenta/NAB)
 
-### 3. Signal construction
-Headline-level scores are aggregated to a daily (ticker, date) signal by averaging. The signal is then **cross-sectionally z-scored** each day — removing the market-wide sentiment level to produce a relative ranking signal: long the most positive tickers, short the most negative.
+---
 
-### 4. Walk-forward validation
-IC (Spearman rank correlation between signal and next-day returns) is computed in rolling windows to test consistency over time and avoid lookahead bias. This mirrors the out-of-sample validation protocol used in production quant research.
+## Approach
 
-### 5. Long/short simulation
-Each day, the top tercile of signal is placed in a simulated long position and the bottom tercile in short, producing a daily L/S return series and cumulative equity curve.
+### 1. Isolation Forest (Baseline)
+Each sliding window is flattened and augmented with statistical features (mean, std, min, max, peak-to-peak, mean absolute delta). Trained on the normal portion of the training split. Anomaly score is the negative mean path length across isolation trees.
+
+### 2. LSTM Autoencoder
+A sequence-to-sequence PyTorch model that learns to reconstruct normal windows. At inference, high reconstruction error (MSE) flags anomalies. Threshold is calibrated on training reconstruction errors. Better than IF on gradual drift patterns requiring temporal context.
+
+### Evaluation
+Both models use **windowed F1** — a prediction within ±100 timesteps of a labeled anomaly point counts as a true positive. This is the standard protocol for NAB's sparse point labels. AUC-ROC is reported as the primary ranking metric.
+
+---
+
+## Dashboard
+
+Interactive anomaly explorer built with Streamlit. Switch between channels, toggle models, adjust the detection threshold, and compare IF vs LSTM side by side.
+
+![Isolation Forest](screenshots/dashboard_if.png)
+![LSTM Autoencoder](screenshots/dashboard_lstm.png)
 
 ---
 
 ## Tech Stack
 
-`Python` · `PyTorch` · `Transformers (HuggingFace)` · `yfinance` · `Pandas` · `NumPy` · `SciPy` · `Streamlit` · `Plotly`
+`Python` · `PyTorch` · `Scikit-learn` · `Pandas` · `NumPy` · `Streamlit` · `Plotly`
